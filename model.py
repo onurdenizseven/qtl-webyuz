@@ -1,85 +1,66 @@
-# app.py
+# model.py
 
-from flask import Flask, request, render_template, jsonify
 import torch
-import torch.nn.functional as F
-from torchvision import transforms
-from PIL import Image
-import io
+import torch.nn as nn
+from torchvision import models
+import pennylane as qml
 
-# Adım 2'de oluşturduğumuz model.py dosyasından HybridQNN sınıfını içe aktar
-from model import HybridQNN, N_QUBITS, N_LAYERS
+# --- Model Mimarisi için Gerekli Sabitler ve Tanımlar ---
 
-# --- Uygulama ve Model Kurulumu ---
-app = Flask(__name__)
+# Kuantum Devresi için temel hiperparametreler
+N_QUBITS = 4
+N_LAYERS = 6
+DEVICE = qml.device("default.qubit", wires=N_QUBITS)
 
-# Modeli ve gerekli bilgileri yükle (sadece bir kez, başlangıçta)
-N_CLASSES = 3
-# Sunucu ortamlarında genellikle GPU bulunmaz, bu yüzden CPU'ya zorluyoruz.
-# map_location=PROCESSOR, modelin CPU üzerinde yüklenmesini sağlar.
-PROCESSOR = torch.device("cpu") 
-
-# Modelin iskeletini oluştur
-model = HybridQNN(n_qubits=N_QUBITS, n_layers=N_LAYERS, n_classes=N_CLASSES)
-# Eğitilmiş ağırlıkları yükle
-model.load_state_dict(torch.load('en_iyi_model.pth', map_location=PROCESSOR))
-model.eval() # Modeli değerlendirme moduna al
-
-# Gelen resimlere uygulanacak dönüşümler
-inference_transforms = transforms.Compose([
-    transforms.Resize(256),
-    transforms.CenterCrop(224),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-])
-# Sınıf isimleri
-class_names = ['paper', 'rock', 'scissors']
-
-# --- Web Sayfası Rotaları (Endpoints) ---
-
-@app.route('/', methods=['GET'])
-def home():
+@qml.qnode(DEVICE, interface="torch", diff_method="backprop")
+def quantum_circuit(inputs, weights):
     """
-    Ana sayfayı (index.html) kullanıcıya gösterir.
+    Bu fonksiyon, klasik veriyi kuantum durumlarına kodlayan ve
+    eğitilebilir kuantum katmanlarını uygulayan kuantum devresini tanımlar.
     """
-    return render_template('index.html')
-
-@app.route('/predict', methods=['POST'])
-def predict():
-    """
-    Kullanıcıdan gelen resim dosyasını alır, model ile tahmin yapar
-    ve sonucu JSON formatında geri döndürür.
-    """
-    if 'file' not in request.files:
-        return jsonify({'error': 'Dosya yüklenmedi'}), 400
+    # Girdileri (klasik özellikler) qubit'lerin açılarına kodla
+    qml.templates.AngleEmbedding(inputs, wires=range(N_QUBITS), rotation="Y")
     
-    file = request.files['file']
+    # Eğitilebilir, dolaşıklık yaratan kuantum katmanları
+    qml.templates.BasicEntanglerLayers(weights, wires=range(N_QUBITS), rotation=qml.RY)
     
-    try:
-        # Gelen dosyayı bir resim olarak aç
-        img_bytes = file.read()
-        image = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-        
-        # Resmi modele uygun formata getir
-        image_tensor = inference_transforms(image).unsqueeze(0)
-        
-        # Tahmin yap
-        with torch.no_grad():
-            outputs = model(image_tensor)
-            probabilities = F.softmax(outputs, dim=1)
-            top_prob, top_idx = torch.max(probabilities, 1)
-            
-            pred_class = class_names[top_idx.item()]
-            confidence = top_prob.item()
-            
-        # Sonucu JSON formatında geri döndür
-        return jsonify({'prediction': pred_class, 'confidence': f"{confidence*100:.2f}"})
+    # Her bir qubit'ten ölçüm alarak sonucu klasik dünyaya geri döndür
+    return [qml.expval(qml.PauliZ(i)) for i in range(N_QUBITS)]
 
-    except Exception as e:
-        # Bir hata oluşursa, hatayı JSON olarak bildir
-        return jsonify({'error': str(e)}), 500
+# Hibrit Kuantum-Klasik Model Sınıfı
+class HybridQNN(nn.Module):
+    """
+    Bu sınıf, önceden eğitilmiş bir ResNet18 modelini (özellik çıkarıcı olarak)
+    ve bir kuantum devresini (sınıflandırıcı olarak) birleştirir.
+    """
+    def __init__(self, n_qubits, n_layers, n_classes):
+        super(HybridQNN, self).__init__()
+        
+        # 1. Klasik Özellik Çıkarıcı (Pre-trained ResNet18)
+        self.feature_extractor = models.resnet18(pretrained=True)
+        num_features = self.feature_extractor.fc.in_features
+        # ResNet'in son sınıflandırma katmanını kaldırıyoruz
+        self.feature_extractor.fc = nn.Identity()
 
-# NOT: Dağıtım (deployment) ortamlarında, sunucuyu Gunicorn gibi bir WSGI sunucusu
-# başlatır. Bu yüzden, geliştirme için kullanılan aşağıdaki blok kaldırılmıştır.
-# if __name__ == '__main__':
-#     app.run(debug=True)
+        # 2. Kuantum Devresine Adaptör Katmanı
+        # ResNet çıktısını (512 özellik) qubit sayısına (4) düşüren lineer katman
+        self.pre_quantum = nn.Linear(num_features, n_qubits)
+
+        # 3. Kuantum Katmanı
+        # PennyLane'in Torch ile uyumlu kuantum katmanı
+        weight_shapes = {"weights": (n_layers, n_qubits)}
+        self.quantum_layer = qml.qnn.TorchLayer(quantum_circuit, weight_shapes)
+
+        # 4. Son Klasik Sınıflandırıcı
+        # Kuantum devresi çıktısını (4 değer) nihai sınıf sayısına (3) eşleyen katman
+        self.classifier = nn.Linear(n_qubits, n_classes)
+
+    def forward(self, x):
+        """
+        Bir verinin modelden geçerken izlediği yol.
+        """
+        x = self.feature_extractor(x)
+        x = self.pre_quantum(x)
+        x = self.quantum_layer(x)
+        x = self.classifier(x)
+        return x
